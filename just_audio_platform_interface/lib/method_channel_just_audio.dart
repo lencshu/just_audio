@@ -231,4 +231,61 @@ class MethodChannelAudioPlayer extends AudioPlayerPlatform {
         (await _channel.invokeMethod<Map<dynamic, dynamic>>(
             'androidEqualizerBandSetGain', request.toMap()))!);
   }
+
+  @override
+  Future<DarwinEqualizerSetEnabledResponse> darwinEqualizerSetEnabled(
+      DarwinEqualizerSetEnabledRequest request) async {
+    return DarwinEqualizerSetEnabledResponse.fromMap(
+        (await _channel.invokeMethod<Map<dynamic, dynamic>>(
+            'setEqualizerEnabled', request.toMap()))!);
+  }
+
+  @override
+  Future<DarwinEqualizerSetBandGainResponse> darwinEqualizerSetBandGain(
+      DarwinEqualizerSetBandGainRequest request) async {
+    return DarwinEqualizerSetBandGainResponse.fromMap(
+        (await _channel.invokeMethod<Map<dynamic, dynamic>>(
+            'setEqualizerBandGain', request.toMap()))!);
+  }
+
+  @override
+  Future<DarwinEqualizerSetPreampResponse> darwinEqualizerSetPreamp(
+      DarwinEqualizerSetPreampRequest request) async {
+    return DarwinEqualizerSetPreampResponse.fromMap(
+        (await _channel.invokeMethod<Map<dynamic, dynamic>>(
+            'setEqualizerPreamp', request.toMap()))!);
+  }
+
+  @override
+  Future<DarwinEqualizerSetReverbResponse> darwinEqualizerSetReverb(
+      DarwinEqualizerSetReverbRequest request) async {
+    return DarwinEqualizerSetReverbResponse.fromMap(
+        (await _channel.invokeMethod<Map<dynamic, dynamic>>(
+            'setEqualizerReverb', request.toMap()))!);
+  }
+
+  @override
+  Future<DarwinEqualizerSetPresetResponse> darwinEqualizerSetPreset(
+      DarwinEqualizerSetPresetRequest request) async {
+    return DarwinEqualizerSetPresetResponse.fromMap(
+        (await _channel.invokeMethod<Map<dynamic, dynamic>>(
+            'setEqualizerPreset', request.toMap()))!);
+  }
+
+  @override
+  Future<DarwinEqualizerResetResponse> darwinEqualizerReset(
+      DarwinEqualizerResetRequest request) async {
+    return DarwinEqualizerResetResponse.fromMap(
+        (await _channel.invokeMethod<Map<dynamic, dynamic>>(
+            'resetEqualizer', request.toMap()))!);
+  }
+
+  @override
+  Future<DarwinEqualizerGetDiagnosticsResponse>
+      darwinEqualizerGetDiagnostics(
+          DarwinEqualizerGetDiagnosticsRequest request) async {
+    return DarwinEqualizerGetDiagnosticsResponse.fromMap(
+        (await _channel.invokeMethod<Map<dynamic, dynamic>>(
+            'getEqualizerDiagnostics', request.toMap()))!);
+  }
 }

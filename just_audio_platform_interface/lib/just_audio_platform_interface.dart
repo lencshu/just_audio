@@ -231,6 +231,54 @@ abstract class AudioPlayerPlatform {
         "androidEqualizerBandSetGain() has not been implemented.");
   }
 
+  /// On iOS/macOS, enables/disables the Darwin graphic equalizer.
+  Future<DarwinEqualizerSetEnabledResponse> darwinEqualizerSetEnabled(
+      DarwinEqualizerSetEnabledRequest request) {
+    throw UnimplementedError(
+        "darwinEqualizerSetEnabled() has not been implemented.");
+  }
+
+  /// On iOS/macOS, sets the gain of a single Darwin equalizer band.
+  Future<DarwinEqualizerSetBandGainResponse> darwinEqualizerSetBandGain(
+      DarwinEqualizerSetBandGainRequest request) {
+    throw UnimplementedError(
+        "darwinEqualizerSetBandGain() has not been implemented.");
+  }
+
+  /// On iOS/macOS, sets the Darwin equalizer preamp gain.
+  Future<DarwinEqualizerSetPreampResponse> darwinEqualizerSetPreamp(
+      DarwinEqualizerSetPreampRequest request) {
+    throw UnimplementedError(
+        "darwinEqualizerSetPreamp() has not been implemented.");
+  }
+
+  /// On iOS/macOS, applies a named preset to the Darwin equalizer.
+  Future<DarwinEqualizerSetReverbResponse> darwinEqualizerSetReverb(
+      DarwinEqualizerSetReverbRequest request) {
+    throw UnimplementedError(
+        "darwinEqualizerSetReverb() has not been implemented.");
+  }
+
+  Future<DarwinEqualizerSetPresetResponse> darwinEqualizerSetPreset(
+      DarwinEqualizerSetPresetRequest request) {
+    throw UnimplementedError(
+        "darwinEqualizerSetPreset() has not been implemented.");
+  }
+
+  /// On iOS/macOS, resets the Darwin equalizer (flat, preamp 0).
+  Future<DarwinEqualizerResetResponse> darwinEqualizerReset(
+      DarwinEqualizerResetRequest request) {
+    throw UnimplementedError(
+        "darwinEqualizerReset() has not been implemented.");
+  }
+
+  /// On iOS/macOS, returns the current Darwin equalizer DSP counters.
+  Future<DarwinEqualizerGetDiagnosticsResponse> darwinEqualizerGetDiagnostics(
+      DarwinEqualizerGetDiagnosticsRequest request) {
+    throw UnimplementedError(
+        "darwinEqualizerGetDiagnostics() has not been implemented.");
+  }
+
   /// Sets the 'crossOrigin' attribute on the web audio element.
   Future<SetWebCrossOriginResponse> setWebCrossOrigin(
       SetWebCrossOriginRequest request) {
@@ -296,6 +344,10 @@ class PlaybackEventMessage {
   final int? errorCode;
   final String? errorMessage;
 
+  /// On iOS/macOS, the current graphic-EQ capability string (e.g. "available",
+  /// "unavailableForHLS"). Null on platforms that don't report it.
+  final String? equalizerCapability;
+
   PlaybackEventMessage({
     required this.processingState,
     required this.updateTime,
@@ -307,6 +359,7 @@ class PlaybackEventMessage {
     required this.androidAudioSessionId,
     this.errorCode,
     this.errorMessage,
+    this.equalizerCapability,
   });
 
   static PlaybackEventMessage fromMap(Map<dynamic, dynamic> map) =>
@@ -329,6 +382,7 @@ class PlaybackEventMessage {
         androidAudioSessionId: map['androidAudioSessionId'] as int?,
         errorCode: map['errorCode'] as int?,
         errorMessage: map['errorMessage'] as String?,
+        equalizerCapability: map['equalizerCapability'] as String?,
       );
 }
 
@@ -1551,3 +1605,164 @@ class SetWebSinkIdRequest {
 }
 
 class SetWebSinkIdResponse {}
+
+// -------------------- Darwin (iOS/macOS) graphic equalizer --------------------
+// A fixed 10-band peaking EQ implemented natively via MTAudioProcessingTap.
+// These requests are routed on the per-player method channel; the player id is
+// implicit in the channel name, so no id field is required here.
+
+class DarwinEqualizerSetEnabledRequest {
+  final bool enabled;
+
+  DarwinEqualizerSetEnabledRequest({required this.enabled});
+
+  Map<dynamic, dynamic> toMap() => <dynamic, dynamic>{'enabled': enabled};
+}
+
+class DarwinEqualizerSetEnabledResponse {
+  static DarwinEqualizerSetEnabledResponse fromMap(Map<dynamic, dynamic> map) =>
+      DarwinEqualizerSetEnabledResponse();
+}
+
+class DarwinEqualizerSetBandGainRequest {
+  final int bandIndex;
+  final double gainDb;
+
+  DarwinEqualizerSetBandGainRequest(
+      {required this.bandIndex, required this.gainDb});
+
+  Map<dynamic, dynamic> toMap() =>
+      <dynamic, dynamic>{'bandIndex': bandIndex, 'gainDb': gainDb};
+}
+
+class DarwinEqualizerSetBandGainResponse {
+  static DarwinEqualizerSetBandGainResponse fromMap(
+          Map<dynamic, dynamic> map) =>
+      DarwinEqualizerSetBandGainResponse();
+}
+
+class DarwinEqualizerSetPreampRequest {
+  final double gainDb;
+
+  DarwinEqualizerSetPreampRequest({required this.gainDb});
+
+  Map<dynamic, dynamic> toMap() => <dynamic, dynamic>{'gainDb': gainDb};
+}
+
+class DarwinEqualizerSetPreampResponse {
+  static DarwinEqualizerSetPreampResponse fromMap(Map<dynamic, dynamic> map) =>
+      DarwinEqualizerSetPreampResponse();
+}
+
+class DarwinEqualizerSetReverbRequest {
+  /// Normalised knob values in [0, 1]. `wet == 0` removes the reverb stage
+  /// from the signal path entirely.
+  final double wet;
+  final double roomSize;
+  final double damp;
+
+  DarwinEqualizerSetReverbRequest(
+      {required this.wet, required this.roomSize, required this.damp});
+
+  Map<dynamic, dynamic> toMap() =>
+      <dynamic, dynamic>{'wet': wet, 'roomSize': roomSize, 'damp': damp};
+}
+
+class DarwinEqualizerSetReverbResponse {
+  static DarwinEqualizerSetReverbResponse fromMap(Map<dynamic, dynamic> map) =>
+      DarwinEqualizerSetReverbResponse();
+}
+
+class DarwinEqualizerSetPresetRequest {
+  final String preset;
+
+  DarwinEqualizerSetPresetRequest({required this.preset});
+
+  Map<dynamic, dynamic> toMap() => <dynamic, dynamic>{'preset': preset};
+}
+
+class DarwinEqualizerSetPresetResponse {
+  static DarwinEqualizerSetPresetResponse fromMap(Map<dynamic, dynamic> map) =>
+      DarwinEqualizerSetPresetResponse();
+}
+
+class DarwinEqualizerResetRequest {
+  DarwinEqualizerResetRequest();
+
+  Map<dynamic, dynamic> toMap() => <dynamic, dynamic>{};
+}
+
+class DarwinEqualizerResetResponse {
+  static DarwinEqualizerResetResponse fromMap(Map<dynamic, dynamic> map) =>
+      DarwinEqualizerResetResponse();
+}
+
+class DarwinEqualizerGetDiagnosticsRequest {
+  DarwinEqualizerGetDiagnosticsRequest();
+
+  Map<dynamic, dynamic> toMap() => <dynamic, dynamic>{};
+}
+
+class DarwinEqualizerDiagnosticsMessage {
+  final int processCallCount;
+  final int bypassCount;
+  final int resetCount;
+  final int unsupportedFormatCount;
+  final double lastSampleRate;
+  final int lastChannelCount;
+
+  /// Tap lifecycle counters and attachment state (see the native
+  /// `AudioTapAttachDiagState`); they distinguish "no tap on the playing item"
+  /// from "tap installed but AVFoundation never invoked it".
+  final int tapInitCount;
+  final int tapPrepareCount;
+  final int tapUnprepareCount;
+  final int tapProcessEntryCount;
+  final int attachState;
+  final int itemStatus;
+
+  DarwinEqualizerDiagnosticsMessage({
+    required this.processCallCount,
+    required this.bypassCount,
+    required this.resetCount,
+    required this.unsupportedFormatCount,
+    required this.lastSampleRate,
+    required this.lastChannelCount,
+    this.tapInitCount = 0,
+    this.tapPrepareCount = 0,
+    this.tapUnprepareCount = 0,
+    this.tapProcessEntryCount = 0,
+    this.attachState = 0,
+    this.itemStatus = -1,
+  });
+
+  static DarwinEqualizerDiagnosticsMessage fromMap(Map<dynamic, dynamic> map) =>
+      DarwinEqualizerDiagnosticsMessage(
+        processCallCount: map['processCallCount'] as int? ?? 0,
+        bypassCount: map['bypassCount'] as int? ?? 0,
+        resetCount: map['resetCount'] as int? ?? 0,
+        unsupportedFormatCount: map['unsupportedFormatCount'] as int? ?? 0,
+        lastSampleRate: (map['lastSampleRate'] as num?)?.toDouble() ?? 0.0,
+        lastChannelCount: map['lastChannelCount'] as int? ?? 0,
+        tapInitCount: map['tapInitCount'] as int? ?? 0,
+        tapPrepareCount: map['tapPrepareCount'] as int? ?? 0,
+        tapUnprepareCount: map['tapUnprepareCount'] as int? ?? 0,
+        tapProcessEntryCount: map['tapProcessEntryCount'] as int? ?? 0,
+        attachState: map['attachState'] as int? ?? 0,
+        itemStatus: map['itemStatus'] as int? ?? -1,
+      );
+}
+
+class DarwinEqualizerGetDiagnosticsResponse {
+  final DarwinEqualizerDiagnosticsMessage diagnostics;
+
+  DarwinEqualizerGetDiagnosticsResponse({required this.diagnostics});
+
+  static DarwinEqualizerGetDiagnosticsResponse fromMap(
+          Map<dynamic, dynamic> map) =>
+      DarwinEqualizerGetDiagnosticsResponse(
+        diagnostics: DarwinEqualizerDiagnosticsMessage.fromMap(
+            map['diagnostics'] as Map<dynamic, dynamic>? ??
+                const <dynamic, dynamic>{}),
+      );
+}

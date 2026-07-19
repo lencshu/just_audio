@@ -324,6 +324,47 @@ class _JustAudioPlayer extends AudioPlayerPlatform {
           AudioEffectSetEnabledRequest request) =>
       _playerAudioHandler.customAudioEffectSetEnabled(request);
 
+  // Darwin (iOS/macOS) equalizer commands must be forwarded to the real
+  // platform player exactly like the Android effect commands above. Without
+  // these overrides the AudioPlayerPlatform base class throws
+  // UnimplementedError, which DarwinEqualizer._guard silently swallows — every
+  // EQ command then "succeeds" while never reaching the native side, and
+  // diagnostics come back as an empty default snapshot.
+  @override
+  Future<DarwinEqualizerSetEnabledResponse> darwinEqualizerSetEnabled(
+          DarwinEqualizerSetEnabledRequest request) =>
+      _playerAudioHandler.customDarwinEqualizerSetEnabled(request);
+
+  @override
+  Future<DarwinEqualizerSetBandGainResponse> darwinEqualizerSetBandGain(
+          DarwinEqualizerSetBandGainRequest request) =>
+      _playerAudioHandler.customDarwinEqualizerSetBandGain(request);
+
+  @override
+  Future<DarwinEqualizerSetPreampResponse> darwinEqualizerSetPreamp(
+          DarwinEqualizerSetPreampRequest request) =>
+      _playerAudioHandler.customDarwinEqualizerSetPreamp(request);
+
+  @override
+  Future<DarwinEqualizerSetReverbResponse> darwinEqualizerSetReverb(
+          DarwinEqualizerSetReverbRequest request) =>
+      _playerAudioHandler.customDarwinEqualizerSetReverb(request);
+
+  @override
+  Future<DarwinEqualizerSetPresetResponse> darwinEqualizerSetPreset(
+          DarwinEqualizerSetPresetRequest request) =>
+      _playerAudioHandler.customDarwinEqualizerSetPreset(request);
+
+  @override
+  Future<DarwinEqualizerResetResponse> darwinEqualizerReset(
+          DarwinEqualizerResetRequest request) =>
+      _playerAudioHandler.customDarwinEqualizerReset(request);
+
+  @override
+  Future<DarwinEqualizerGetDiagnosticsResponse> darwinEqualizerGetDiagnostics(
+          DarwinEqualizerGetDiagnosticsRequest request) =>
+      _playerAudioHandler.customDarwinEqualizerGetDiagnostics(request);
+
   @override
   Future<SetAllowsExternalPlaybackResponse> setAllowsExternalPlayback(
           SetAllowsExternalPlaybackRequest request) =>
@@ -552,6 +593,35 @@ class _PlayerAudioHandler extends BaseAudioHandler
   Future<AudioEffectSetEnabledResponse> customAudioEffectSetEnabled(
           AudioEffectSetEnabledRequest request) async =>
       await (await _player).audioEffectSetEnabled(request);
+
+  Future<DarwinEqualizerSetEnabledResponse> customDarwinEqualizerSetEnabled(
+          DarwinEqualizerSetEnabledRequest request) async =>
+      await (await _player).darwinEqualizerSetEnabled(request);
+
+  Future<DarwinEqualizerSetBandGainResponse> customDarwinEqualizerSetBandGain(
+          DarwinEqualizerSetBandGainRequest request) async =>
+      await (await _player).darwinEqualizerSetBandGain(request);
+
+  Future<DarwinEqualizerSetPreampResponse> customDarwinEqualizerSetPreamp(
+          DarwinEqualizerSetPreampRequest request) async =>
+      await (await _player).darwinEqualizerSetPreamp(request);
+
+  Future<DarwinEqualizerSetReverbResponse> customDarwinEqualizerSetReverb(
+          DarwinEqualizerSetReverbRequest request) async =>
+      await (await _player).darwinEqualizerSetReverb(request);
+
+  Future<DarwinEqualizerSetPresetResponse> customDarwinEqualizerSetPreset(
+          DarwinEqualizerSetPresetRequest request) async =>
+      await (await _player).darwinEqualizerSetPreset(request);
+
+  Future<DarwinEqualizerResetResponse> customDarwinEqualizerReset(
+          DarwinEqualizerResetRequest request) async =>
+      await (await _player).darwinEqualizerReset(request);
+
+  Future<DarwinEqualizerGetDiagnosticsResponse>
+      customDarwinEqualizerGetDiagnostics(
+              DarwinEqualizerGetDiagnosticsRequest request) async =>
+          await (await _player).darwinEqualizerGetDiagnostics(request);
 
   Future<SetAllowsExternalPlaybackResponse> customSetAllowsExternalPlayback(
           SetAllowsExternalPlaybackRequest request) async =>

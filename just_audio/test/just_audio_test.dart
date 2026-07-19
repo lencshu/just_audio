@@ -1689,6 +1689,25 @@ void runTests() {
     }
   });
 
+  test('DarwinEqualizer diagnostics', () async {
+    final player = AudioPlayer();
+    await player.setUrl('https://foo.foo/foo.mp3');
+
+    final diagnostics = await player.darwinEqualizer.diagnostics();
+    expect(diagnostics.processCallCount, equals(12));
+    expect(diagnostics.bypassCount, equals(3));
+    expect(diagnostics.resetCount, equals(2));
+    expect(diagnostics.unsupportedFormatCount, equals(1));
+    expect(diagnostics.lastSampleRate, equals(48000.0));
+    expect(diagnostics.lastChannelCount, equals(2));
+    expect(
+      diagnostics.toLogString(),
+      contains('unsupportedFormatCount=1'),
+    );
+
+    await player.dispose();
+  });
+
   test('asyncMessages', () async {
     final player = AudioPlayer();
     await player.setUrl('https://foo.foo/foo.mp3');
@@ -2144,6 +2163,22 @@ class MockAudioPlayer extends AudioPlayerPlatform {
   Future<AndroidEqualizerBandSetGainResponse> androidEqualizerBandSetGain(
       AndroidEqualizerBandSetGainRequest request) async {
     return AndroidEqualizerBandSetGainResponse();
+  }
+
+  @override
+  Future<DarwinEqualizerGetDiagnosticsResponse>
+      darwinEqualizerGetDiagnostics(
+          DarwinEqualizerGetDiagnosticsRequest request) async {
+    return DarwinEqualizerGetDiagnosticsResponse(
+      diagnostics: DarwinEqualizerDiagnosticsMessage(
+        processCallCount: 12,
+        bypassCount: 3,
+        resetCount: 2,
+        unsupportedFormatCount: 1,
+        lastSampleRate: 48000.0,
+        lastChannelCount: 2,
+      ),
+    );
   }
 }
 

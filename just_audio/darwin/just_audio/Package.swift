@@ -17,9 +17,20 @@ let package = Package(
         .target(
             name: "just_audio",
             dependencies: [],
+            // Host-only DSP unit tests are not part of the plugin build.
+            exclude: [
+                "AudioEffects/Tests"
+            ],
             cSettings: [
                 .headerSearchPath("include/just_audio")
+            ],
+            linkerSettings: [
+                .linkedFramework("AVFoundation"),
+                .linkedFramework("MediaToolbox"),
+                .linkedFramework("AudioToolbox")
             ]
         )
-    ]
+    ],
+    // The AudioEffects DSP core and tap layer are C++/Objective-C++.
+    cxxLanguageStandard: .cxx17
 )

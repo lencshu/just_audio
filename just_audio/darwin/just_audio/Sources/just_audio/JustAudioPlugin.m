@@ -9,6 +9,10 @@
 }
 
 + (void)registerWithRegistrar:(NSObject<FlutterPluginRegistrar>*)registrar {
+    // Native build stamp: proves WHICH native revision the running app actually
+    // linked. Compiled-in at build time, so a stale Xcode/SwiftPM cache is
+    // immediately visible as an old (or missing) stamp in the console.
+    NSLog(@"[JustAudioEQ][build] native revision eq-diag-2 (%s %s)", __DATE__, __TIME__);
     FlutterMethodChannel* channel = [FlutterMethodChannel
         methodChannelWithName:@"com.ryanheise.just_audio.methods"
               binaryMessenger:[registrar messenger]];

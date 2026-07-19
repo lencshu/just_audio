@@ -7,9 +7,15 @@
 #import "./include/just_audio/ConcatenatingAudioSource.h"
 #import "./include/just_audio/LoopingAudioSource.h"
 #import "./include/just_audio/ClippingAudioSource.h"
+#import "AudioEffects/Equalizer/EqualizerController.h"
 #import <AVFoundation/AVFoundation.h>
+#import <objc/runtime.h>
 #import <stdlib.h>
 #include <TargetConditionals.h>
+
+// Associated-object key: caches the just_audio source type string on each
+// AVPlayerItem so the equalizer can detect HLS without re-parsing (proposal §27).
+static const void *kJustAudioSourceTypeKey = &kJustAudioSourceTypeKey;
 
 #define TREADMILL_SIZE 2
 #define ERROR_ABORT 10000000
@@ -53,6 +59,12 @@
     NSDictionary<NSString *, NSObject *> *_icyMetadata;
     NSNumber *_errorCode;
     NSString *_errorMessage;
+    EqualizerController *_equalizer;
+    NSString *_equalizerCapability;
+    NSHashTable *_equalizerAttachedItems;
+    // Monotonic token that invalidates a pending asynchronous load continuation
+    // (the pre-enqueue EQ attach gate) when a newer load/dispose supersedes it.
+    NSInteger _loadGeneration;
 }
 
 - (instancetype)initWithRegistrar:(NSObject<FlutterPluginRegistrar> *)registrar playerId:(NSString*)idParam loadConfiguration:(NSDictionary *)loadConfiguration useLazyPreparation:(BOOL)useLazyPreparation {
@@ -115,6 +127,10 @@
     _icyMetadata = @{};
     _errorCode = (NSNumber *)[NSNull null];
     _errorMessage = (NSString *)[NSNull null];
+    _equalizer = [[EqualizerController alloc] init];
+    _equalizerCapability = @"unavailableUnknown";
+    _equalizerAttachedItems = [NSHashTable weakObjectsHashTable];
+    _loadGeneration = 0;
     __weak __typeof__(self) weakSelf = self;
     [_methodChannel setMethodCallHandler:^(FlutterMethodCall* call, FlutterResult result) {
         [weakSelf handleMethodCall:call result:result];
@@ -180,6 +196,31 @@
             result(@{});
         } else if ([@"setAndroidAudioAttributes" isEqualToString:call.method]) {
             result(@{});
+        } else if ([@"setEqualizerEnabled" isEqualToString:call.method]) {
+            [_equalizer setEnabled:(BOOL)[request[@"enabled"] boolValue]];
+            result(@{});
+        } else if ([@"setEqualizerBandGain" isEqualToString:call.method]) {
+            [_equalizer setBandGainAtIndex:[request[@"bandIndex"] integerValue]
+                                    gainDb:(float)[request[@"gainDb"] doubleValue]];
+            result(@{});
+        } else if ([@"setEqualizerPreamp" isEqualToString:call.method]) {
+            [_equalizer setPreampDb:(float)[request[@"gainDb"] doubleValue]];
+            result(@{});
+        } else if ([@"setEqualizerReverb" isEqualToString:call.method]) {
+            [_equalizer setReverbWet:(float)[request[@"wet"] doubleValue]
+                            roomSize:(float)[request[@"roomSize"] doubleValue]
+                                damp:(float)[request[@"damp"] doubleValue]];
+            result(@{});
+        } else if ([@"setEqualizerPreset" isEqualToString:call.method]) {
+            [_equalizer applyPresetNamed:(NSString *)request[@"preset"]];
+            result(@{});
+        } else if ([@"resetEqualizer" isEqualToString:call.method]) {
+            [_equalizer reset];
+            result(@{});
+        } else if ([@"getEqualizerCapability" isEqualToString:call.method]) {
+            result(@{@"capability": _equalizerCapability});
+        } else if ([@"getEqualizerDiagnostics" isEqualToString:call.method]) {
+            result(@{@"diagnostics": [_equalizer diagnosticsForItem:_player.currentItem]});
         } else {
             result(FlutterMethodNotImplemented);
         }
@@ -350,6 +391,7 @@
             @"currentIndex": @(_index),
             @"errorCode": _errorCode,
             @"errorMessage": _errorMessage,
+            @"equalizerCapability": _equalizerCapability,
     }];
 }
 
@@ -428,6 +470,99 @@
     // TODO: Check this. Shouldn't need to removeOutput
     // later?
     [playerItem addOutput:metadataOutput];
+
+    // The EQ tap is installed in -preAttachEqualizerToItem: right before the
+    // item is inserted into the AVQueuePlayer, so the render graph is built
+    // with the tap present. -attachEqualizerToItem: at ReadyToPlay is only a
+    // last-resort fallback; assigning audioMix that late may not trigger
+    // tap_Prepare, but audio always keeps playing regardless.
+}
+
+// Install the EQ tap on `playerItem` BEFORE it is inserted into the
+// AVQueuePlayer. AVFoundation freezes an item's audio render graph when it
+// becomes ReadyToPlay; an audioMix assigned at/after that point never triggers
+// tap_Prepare (the tap sits off the render path — sampleRate/process stay zero).
+// The tap must therefore be present before the item enters the player.
+//
+// Local (file://) assets and assets whose keys already resolved install
+// synchronously here. For unresolved remote assets this method must NOT block
+// the platform thread, so it kicks off the asynchronous attach immediately —
+// for queued (not-yet-current) items the keys normally resolve well before
+// AVQueuePlayer preloads them to ReadyToPlay, so the mix still lands in time.
+// The CURRENT item of a load() is handled deterministically by the pre-enqueue
+// gate in -load:… (which waits for this attach before enqueueing).
+// Propagate the just_audio source-type tag (HLS detection hint) to a
+// playerItem2 created for gapless looping, so the equalizer applies the same
+// bypass decision to both items of the pair.
+- (void)copySourceTypeTagFrom:(AVPlayerItem *)fromItem to:(AVPlayerItem *)toItem {
+    if (!fromItem || !toItem) return;
+    objc_setAssociatedObject(toItem, kJustAudioSourceTypeKey,
+                             objc_getAssociatedObject(fromItem, kJustAudioSourceTypeKey),
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+// One line per item entering the AVQueuePlayer: whether it enters WITH its
+// audio mix (tap can prepare) or without (tap installed later never will).
+// This is the single most decisive piece of evidence for a silent EQ.
+- (void)logEqualizerInsert:(AVPlayerItem *)playerItem context:(NSString *)context index:(int)index {
+    if (!_equalizer || !playerItem) return;
+    NSLog(@"[JustAudioEQ][player] insert(%@) idx=%d item=%p hasMix=%d itemStatus=%ld",
+          context, index, playerItem, playerItem.audioMix != nil ? 1 : 0,
+          (long)playerItem.status);
+}
+
+- (void)preAttachEqualizerToItem:(AVPlayerItem *)playerItem {
+    if (!playerItem || !_equalizer) return;
+    if ([_equalizerAttachedItems containsObject:playerItem]) return;
+
+    NSString *sourceType = objc_getAssociatedObject(playerItem, kJustAudioSourceTypeKey);
+    if ([_equalizer attachIfResolvedToItem:playerItem sourceType:sourceType]) {
+        [_equalizerAttachedItems addObject:playerItem];
+        NSString *capString = NSStringFromEqualizerCapability(_equalizer.lastCapability);
+        if (![capString isEqualToString:_equalizerCapability]) {
+            _equalizerCapability = capString;
+            [self broadcastPlaybackEvent];
+        }
+        return;
+    }
+    // Keys not resolved yet: start the async attach now (don't wait for
+    // ReadyToPlay — that is usually too late for the tap to enter the graph).
+    [self attachEqualizerToItem:playerItem];
+}
+
+- (void)attachEqualizerToItem:(AVPlayerItem *)playerItem {
+    if (!playerItem || !_equalizer) return;
+    // Guard against attaching twice to the same item.
+    if ([_equalizerAttachedItems containsObject:playerItem]) return;
+    [_equalizerAttachedItems addObject:playerItem];
+
+    NSString *sourceType = objc_getAssociatedObject(playerItem, kJustAudioSourceTypeKey);
+    __weak __typeof__(self) weakSelf = self;
+    [_equalizer attachToItem:playerItem
+                  sourceType:sourceType
+                  completion:^(EqualizerCapability capability) {
+        // attachToItem may complete on a background queue; hop to main before
+        // touching player state / broadcasting (proposal §24: no realtime work
+        // here — this is the control path).
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __typeof__(self) strongSelf = weakSelf;
+            if (!strongSelf) return;
+            // Was the item already inside the player (render graph possibly
+            // frozen) by the time the asynchronous mix assignment landed?
+            // "inPlayer=1 itemStatus=1" here explains a permanently dead tap.
+            NSLog(@"[JustAudioEQ][player] async attach done item=%p cap=%@ "
+                   "inPlayer=%d isCurrent=%d itemStatus=%ld",
+                  playerItem, NSStringFromEqualizerCapability(capability),
+                  [strongSelf->_player.items containsObject:playerItem] ? 1 : 0,
+                  strongSelf->_player.currentItem == playerItem ? 1 : 0,
+                  (long)playerItem.status);
+            NSString *capString = NSStringFromEqualizerCapability(capability);
+            if (![capString isEqualToString:strongSelf->_equalizerCapability]) {
+                strongSelf->_equalizerCapability = capString;
+                [strongSelf broadcastPlaybackEvent];
+            }
+        });
+    }];
 }
 
 - (void)metadataOutput:(AVPlayerItemMetadataOutput *)output didOutputTimedMetadataGroups:(NSArray<AVTimedMetadataGroup *> *)groups fromPlayerItemTrack:(AVPlayerItemTrack *)track {
@@ -470,12 +605,13 @@
 
 - (AudioSource *)decodeAudioSource:(NSDictionary *)data {
     NSString *type = data[@"type"];
-    if ([@"progressive" isEqualToString:type]) {
-        return [[UriAudioSource alloc] initWithId:data[@"id"] uri:data[@"uri"] loadControl:_loadControl headers:data[@"headers"] options:data[@"options"]];
-    } else if ([@"dash" isEqualToString:type]) {
-        return [[UriAudioSource alloc] initWithId:data[@"id"] uri:data[@"uri"] loadControl:_loadControl headers:data[@"headers"] options:data[@"options"]];
-    } else if ([@"hls" isEqualToString:type]) {
-        return [[UriAudioSource alloc] initWithId:data[@"id"] uri:data[@"uri"] loadControl:_loadControl headers:data[@"headers"] options:data[@"options"]];
+    if ([@"progressive" isEqualToString:type] || [@"dash" isEqualToString:type] || [@"hls" isEqualToString:type]) {
+        UriAudioSource *src = [[UriAudioSource alloc] initWithId:data[@"id"] uri:data[@"uri"] loadControl:_loadControl headers:data[@"headers"] options:data[@"options"]];
+        // Tag the item with its source type so the equalizer can detect HLS.
+        if (src.playerItem) {
+            objc_setAssociatedObject(src.playerItem, kJustAudioSourceTypeKey, type, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        return src;
     } else if ([@"concatenating" isEqualToString:type]) {
         return [[ConcatenatingAudioSource alloc] initWithId:data[@"id"]
                                                audioSources:[self decodeAudioSources:data[@"children"]]
@@ -553,6 +689,8 @@
                     break;
                 }
                 //NSLog(@"inserting item %d", si);
+                [self preAttachEqualizerToItem:_indexedAudioSources[si].playerItem];
+                [self logEqualizerInsert:_indexedAudioSources[si].playerItem context:@"enqueue" index:si];
                 [_player insertItem:_indexedAudioSources[si].playerItem afterItem:nil];
                 if (_loopMode == lmLoopOne) {
                     // We only want one item in the queue.
@@ -569,15 +707,23 @@
             //NSLog(@"### add loop item:%d", si);
             if (!_indexedAudioSources[si].playerItem2) {
                 [_indexedAudioSources[si] preparePlayerItem2];
+                [self copySourceTypeTagFrom:_indexedAudioSources[si].playerItem
+                                         to:_indexedAudioSources[si].playerItem2];
                 [self addItemObservers:_indexedAudioSources[si].playerItem2];
             }
+            [self preAttachEqualizerToItem:_indexedAudioSources[si].playerItem2];
+            [self logEqualizerInsert:_indexedAudioSources[si].playerItem2 context:@"loopAll" index:si];
             [_player insertItem:_indexedAudioSources[si].playerItem2 afterItem:nil];
         } else if (_loopMode == lmLoopOne) {
             //NSLog(@"### add loop item:%d", _index);
             if (!_indexedAudioSources[_index].playerItem2) {
                 [_indexedAudioSources[_index] preparePlayerItem2];
+                [self copySourceTypeTagFrom:_indexedAudioSources[_index].playerItem
+                                         to:_indexedAudioSources[_index].playerItem2];
                 [self addItemObservers:_indexedAudioSources[_index].playerItem2];
             }
+            [self preAttachEqualizerToItem:_indexedAudioSources[_index].playerItem2];
+            [self logEqualizerInsert:_indexedAudioSources[_index].playerItem2 context:@"loopOne" index:_index];
             [_player insertItem:_indexedAudioSources[_index].playerItem2 afterItem:nil];
         }
     }
@@ -610,6 +756,8 @@
     if (_processingState == psLoading) {
         [self abortExistingConnection:NO];
     }
+    // Supersede any pending pre-enqueue EQ gate from a previous load.
+    _loadGeneration++;
     _loadResult = result;
     _processingState = psLoading;
     _index = (initialIndex != (id)[NSNull null]) ? [initialIndex intValue] : 0;
@@ -697,6 +845,103 @@
             ];
         }
     }
+    // Pre-enqueue EQ gate: make sure the item that will become current has its
+    // audio mix (EQ tap) installed BEFORE it is inserted into the player, then
+    // continue with the remainder of the load in -finishLoad:. Setting the mix
+    // after the item reaches ReadyToPlay never triggers tap_Prepare, and for
+    // remote assets the required track keys load asynchronously — so this is
+    // the only point where the tap can be installed deterministically. The gate
+    // is bounded and fails open (see -prepareEqualizerThenFinishLoad:), and the
+    // asset key load it waits on is work AVPlayer needs before playing anyway,
+    // so it adds no net startup latency.
+    [self prepareEqualizerThenFinishLoad:initialPosition];
+    /* NSLog(@"load:"); */
+    /* for (int i = 0; i < [_indexedAudioSources count]; i++) { */
+    /*     NSLog(@"- %@", _indexedAudioSources[i].sourceId); */
+    /* } */
+}
+
+// Installs the EQ tap on the to-be-current item, waiting (bounded, fail-open)
+// for its asset keys when necessary, then runs -finishLoad:. The continuation
+// is guarded by _loadGeneration so a newer load()/dispose cancels it.
+- (void)prepareEqualizerThenFinishLoad:(CMTime)initialPosition {
+    IndexedPlayerItem *primaryItem =
+        (_indexedAudioSources.count > 0 && _index >= 0 &&
+         _index < _indexedAudioSources.count)
+            ? _indexedAudioSources[_index].playerItem
+            : nil;
+    if (!primaryItem || !_equalizer ||
+        [_equalizerAttachedItems containsObject:primaryItem]) {
+        [self finishLoad:initialPosition];
+        return;
+    }
+    NSString *sourceType = objc_getAssociatedObject(primaryItem, kJustAudioSourceTypeKey);
+    if ([_equalizer attachIfResolvedToItem:primaryItem sourceType:sourceType]) {
+        // Local file / already-resolved asset: installed synchronously.
+        NSLog(@"[JustAudioEQ][player] load gate: sync attach item=%p cap=%@",
+              primaryItem, NSStringFromEqualizerCapability(_equalizer.lastCapability));
+        [_equalizerAttachedItems addObject:primaryItem];
+        NSString *capString = NSStringFromEqualizerCapability(_equalizer.lastCapability);
+        if (![capString isEqualToString:_equalizerCapability]) {
+            _equalizerCapability = capString;
+        }
+        [self finishLoad:initialPosition];
+        return;
+    }
+
+    // Remote asset: attach asynchronously and continue the load once done.
+    NSLog(@"[JustAudioEQ][player] load gate: awaiting async attach item=%p type=%@",
+          primaryItem, sourceType ?: @"?");
+    [_equalizerAttachedItems addObject:primaryItem];
+    NSInteger generation = _loadGeneration;
+    __weak __typeof__(self) weakSelf = self;
+    __block BOOL continued = NO;
+    void (^continueLoad)(void) = ^{
+        __typeof__(self) strongSelf = weakSelf;
+        if (!strongSelf || continued) return;
+        continued = YES;
+        if (strongSelf->_loadGeneration != generation) return;  // superseded
+        [strongSelf finishLoad:initialPosition];
+    };
+    [_equalizer attachToItem:primaryItem
+                  sourceType:sourceType
+                  completion:^(EqualizerCapability capability) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __typeof__(self) strongSelf = weakSelf;
+            if (!strongSelf) return;
+            // continued==YES here means the 4s fail-open timer already fired:
+            // the mix landed AFTER enqueue and this item's tap is likely dead.
+            NSLog(@"[JustAudioEQ][player] load gate: async attach done item=%p "
+                   "cap=%@ lateAfterTimeout=%d itemStatus=%ld",
+                  primaryItem, NSStringFromEqualizerCapability(capability),
+                  continued ? 1 : 0, (long)primaryItem.status);
+            NSString *capString = NSStringFromEqualizerCapability(capability);
+            if (strongSelf->_loadGeneration == generation &&
+                ![capString isEqualToString:strongSelf->_equalizerCapability]) {
+                strongSelf->_equalizerCapability = capString;
+                // -finishLoad: broadcasts; only broadcast here when the gate
+                // already timed out and the attach finished late.
+                if (continued) [strongSelf broadcastPlaybackEvent];
+            }
+            continueLoad();
+        });
+    }];
+    // Fail open: never let a slow/unreachable asset stall the load longer than
+    // this. If the attach completes later it still installs the mix (it may
+    // simply be too late to enter the render graph — audio keeps playing).
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (!continued) {
+            NSLog(@"[JustAudioEQ][player] load gate: TIMEOUT after 4s item=%p — "
+                   "enqueuing without mix; a later attach cannot enter the render graph",
+                  primaryItem);
+        }
+        continueLoad();
+    });
+}
+
+// The remainder of -load:… that must run only after the pre-enqueue EQ gate.
+- (void)finishLoad:(CMTime)initialPosition {
     // Initialise the AVQueuePlayer with items.
     [self enqueueFrom:_index];
     // Notify each IndexedAudioSource that it's been attached to the player.
@@ -718,10 +963,6 @@
     } else {
         // We send result after the playerItem is ready in observeValueForKeyPath.
     }
-    /* NSLog(@"load:"); */
-    /* for (int i = 0; i < [_indexedAudioSources count]; i++) { */
-    /*     NSLog(@"- %@", _indexedAudioSources[i].sourceId); */
-    /* } */
 }
 
 - (void)updateOrder {
@@ -794,6 +1035,10 @@
         [playerItem.audioSource onStatusChanged:status];
         switch (status) {
             case AVPlayerItemStatusReadyToPlay: {
+                // At ReadyToPlay the concrete AVAssetTrack and its trackID are
+                // stable. Install the audio mix before resolving Dart's load(),
+                // which in turn waits for the capability before calling play().
+                [self attachEqualizerToItem:playerItem];
                 if (playerItem != _player.currentItem) return;
                 // Detect buffering in different ways depending on whether we're playing
                 if (_playing) {
@@ -1212,6 +1457,10 @@
         }
         return;
     }
+    // Time jump: request a DSP filter-history reset so the biquads do not carry
+    // stale state across the discontinuity (proposal §23/§26.3). The reset runs
+    // inside the audio callback; here we only bump the generation counter.
+    [_equalizer requestReset];
     int index = _index;
     if (newIndex != (id)[NSNull null]) {
         index = [newIndex intValue];
@@ -1342,6 +1591,8 @@
 }
 
 - (void)dispose:(BOOL)calledFromDealloc {
+    // Cancel any pending pre-enqueue EQ gate continuation.
+    _loadGeneration++;
     if (!_player) return;
     if (_processingState != psIdle) {
         [_player pause];
@@ -1382,6 +1633,11 @@
         }
         _player = nil;
     }
+    // The equalizer holds no player/item references. Items release their
+    // AVAudioMix (and thus the tap) as they deallocate; each tap frees its
+    // context exactly once in its finalize callback (proposal §26.4).
+    _equalizer = nil;
+    [_equalizerAttachedItems removeAllObjects];
     // Untested:
     [_eventChannel dispose];
     [_dataEventChannel dispose];

@@ -92,6 +92,10 @@ class AudioPlayer {
   /// native platform is not needed.
   _IdleAudioPlayer? _idlePlatform;
 
+  /// The Darwin (iOS/macOS) graphic equalizer, created lazily via
+  /// [darwinEqualizer]. Null until first accessed.
+  DarwinEqualizer? _darwinEqualizer;
+
   /// The subscription to the event channel of the current platform
   /// implementation. When switching between active and inactive modes, this is
   /// used to cancel the subscription to the previous platform's events and
@@ -1181,6 +1185,14 @@ class AudioPlayer {
     await (await _platform).setVolume(SetVolumeRequest(volume: volume));
   }
 
+  /// The iOS/macOS graphic equalizer, a fixed 10-band peaking EQ implemented
+  /// natively via `MTAudioProcessingTap`. Created lazily on first access. On
+  /// non-Darwin platforms the commands are no-ops (the platform interface
+  /// throws [UnimplementedError], which this class swallows), so it is safe to
+  /// reference from cross-platform code. See [DarwinEqualizer].
+  DarwinEqualizer get darwinEqualizer =>
+      _darwinEqualizer ??= DarwinEqualizer._(this);
+
   /// Sets whether silence should be skipped in audio playback. (Currently
   /// Android only).
   Future<void> setSkipSilenceEnabled(bool enabled) async {
@@ -1434,6 +1446,8 @@ class AudioPlayer {
       await _errorsSubscription?.cancel();
       await _errorsResetSubscription?.cancel();
 
+      await _darwinEqualizer?._dispose();
+
       await _playerEventSubject.close();
 
       await _playbackEventPipe;
@@ -1584,6 +1598,9 @@ class AudioPlayer {
           errorMessage: message.errorMessage,
         );
         _loadFuture = Future.value(newPlaybackEvent.duration);
+        if (message.equalizerCapability != null) {
+          _darwinEqualizer?._updateCapability(message.equalizerCapability!);
+        }
         if (newPlaybackEvent == playbackEvent) {
           return;
         }
@@ -1740,6 +1757,12 @@ class AudioPlayer {
         }
         for (var audioEffect in _audioPipeline._audioEffects) {
           await audioEffect._activate(platform);
+          if (checkInterruption()) return inactiveResult(platform);
+        }
+        // Re-apply the Darwin equalizer state on a freshly connected platform
+        // (e.g. after backgrounding). No-op if never used or not on iOS/macOS.
+        if (_darwinEqualizer != null) {
+          await _darwinEqualizer!._restore(platform);
           if (checkInterruption()) return inactiveResult(platform);
         }
         if (playing) {
@@ -4552,6 +4575,391 @@ class AndroidEqualizer extends AudioEffect with AndroidAudioEffect {
         parameters: null,
       );
 }
+
+/// The fixed centre frequencies (Hz) of the 10-band [DarwinEqualizer]. Matches
+/// the native band table.
+const List<double> kDarwinEqualizerFrequencies = <double>[
+  31.25,
+  62.5,
+  125,
+  250,
+  500,
+  1000,
+  2000,
+  4000,
+  8000,
+  16000,
+];
+
+/// Minimum/maximum per-band gain (dB) accepted by the [DarwinEqualizer].
+const double kDarwinEqualizerMinBandGainDb = -12.0;
+const double kDarwinEqualizerMaxBandGainDb = 12.0;
+
+/// Minimum/maximum preamp gain (dB). Attenuation-only in phase 1 to avoid
+/// accidental clipping.
+const double kDarwinEqualizerMinPreampDb = -24.0;
+const double kDarwinEqualizerMaxPreampDb = 0.0;
+
+/// Reverb settings for the [DarwinEqualizer]'s post-EQ Freeverb stage. All
+/// values are normalised knob positions in [0, 1]; `wet == 0` removes the
+/// reverb from the signal path entirely.
+typedef DarwinEqualizerReverb = ({double wet, double roomSize, double damp});
+
+/// Built-in presets for the [DarwinEqualizer]. The enum name is sent verbatim
+/// to the native side, so keep these in sync with the native preset table.
+enum DarwinEqualizerPreset {
+  flat,
+  bassBoost,
+  bassReduce,
+  trebleBoost,
+  trebleReduce,
+  vocal,
+  rock,
+  pop,
+  jazz,
+  classical,
+  electronic,
+  loudness,
+}
+
+/// Whether the [DarwinEqualizer] can process the current audio source
+/// (proposal §7). When unavailable, audio still plays unprocessed (fail-open).
+enum DarwinEqualizerCapability {
+  available,
+  unavailableForHLS,
+  unavailableForProtectedContent,
+  unavailableNoAudioTrack,
+  unavailableUnsupportedFormat,
+  unavailableUnsupportedChannelCount,
+  unavailableTapCreationFailed,
+  unavailableUnknown,
+}
+
+DarwinEqualizerCapability _parseDarwinEqualizerCapability(String value) {
+  for (final c in DarwinEqualizerCapability.values) {
+    if (c.name == value) return c;
+  }
+  return DarwinEqualizerCapability.unavailableUnknown;
+}
+
+/// Why a [DarwinEqualizerDiagnostics] snapshot of the playing item came back
+/// all-zero. Mirrors the native `AudioTapAttachDiagState` (raw values stable).
+enum DarwinEqualizerAttachState {
+  /// Not evaluated (e.g. non-Darwin platform or legacy native build).
+  unknown,
+
+  /// The player has no current item.
+  noCurrentItem,
+
+  /// The playing item exists but no `audioMix` was ever assigned to it — the
+  /// tap was never installed on the item that is actually audible.
+  noAudioMix,
+
+  /// An `audioMix` is present but contains no processing tap.
+  noTapInMix,
+
+  /// A tap is present but its storage context is missing (native bug).
+  tapNoStorage,
+
+  /// The tap is installed on the playing item with a live context; consult
+  /// the prepare/process counters to see whether AVFoundation ever ran it.
+  tapPresent,
+}
+
+/// A point-in-time snapshot of the native Darwin equalizer DSP counters.
+class DarwinEqualizerDiagnostics {
+  final int processCallCount;
+  final int bypassCount;
+  final int resetCount;
+  final int unsupportedFormatCount;
+  final double lastSampleRate;
+  final int lastChannelCount;
+
+  /// Tap lifecycle counters (tap-level, independent of the DSP counters):
+  /// whether AVFoundation ever invoked init/prepare/process on the tap that is
+  /// installed on the *playing* item.
+  final int tapInitCount;
+  final int tapPrepareCount;
+  final int tapUnprepareCount;
+  final int tapProcessEntryCount;
+
+  /// Attachment state of the playing item (see [DarwinEqualizerAttachState]).
+  final DarwinEqualizerAttachState attachState;
+
+  /// Raw `AVPlayerItemStatus` of the inspected item (0 unknown, 1 readyToPlay,
+  /// 2 failed); -1 when not applicable.
+  final int itemStatus;
+
+  const DarwinEqualizerDiagnostics({
+    this.processCallCount = 0,
+    this.bypassCount = 0,
+    this.resetCount = 0,
+    this.unsupportedFormatCount = 0,
+    this.lastSampleRate = 0.0,
+    this.lastChannelCount = 0,
+    this.tapInitCount = 0,
+    this.tapPrepareCount = 0,
+    this.tapUnprepareCount = 0,
+    this.tapProcessEntryCount = 0,
+    this.attachState = DarwinEqualizerAttachState.unknown,
+    this.itemStatus = -1,
+  });
+
+  factory DarwinEqualizerDiagnostics._fromMessage(
+          DarwinEqualizerDiagnosticsMessage message) =>
+      DarwinEqualizerDiagnostics(
+        processCallCount: message.processCallCount,
+        bypassCount: message.bypassCount,
+        resetCount: message.resetCount,
+        unsupportedFormatCount: message.unsupportedFormatCount,
+        lastSampleRate: message.lastSampleRate,
+        lastChannelCount: message.lastChannelCount,
+        tapInitCount: message.tapInitCount,
+        tapPrepareCount: message.tapPrepareCount,
+        tapUnprepareCount: message.tapUnprepareCount,
+        tapProcessEntryCount: message.tapProcessEntryCount,
+        attachState: (message.attachState >= 0 &&
+                message.attachState < DarwinEqualizerAttachState.values.length)
+            ? DarwinEqualizerAttachState.values[message.attachState]
+            : DarwinEqualizerAttachState.unknown,
+        itemStatus: message.itemStatus,
+      );
+
+  /// A compact line suitable for software diagnostics logs.
+  String toLogString() =>
+      'DarwinEqualizerDiagnostics('
+      'processCallCount=$processCallCount, '
+      'bypassCount=$bypassCount, '
+      'resetCount=$resetCount, '
+      'unsupportedFormatCount=$unsupportedFormatCount, '
+      'lastSampleRate=$lastSampleRate, '
+      'lastChannelCount=$lastChannelCount, '
+      'tapInit=$tapInitCount, '
+      'tapPrepare=$tapPrepareCount, '
+      'tapUnprepare=$tapUnprepareCount, '
+      'tapProcessEntry=$tapProcessEntryCount, '
+      'attachState=${attachState.name}, '
+      'itemStatus=$itemStatus)';
+
+  @override
+  String toString() => toLogString();
+}
+
+/// A fixed 10-band graphic equalizer for iOS and macOS, implemented natively
+/// with `MTAudioProcessingTap`. Obtain one via [AudioPlayer.darwinEqualizer].
+///
+/// The equalizer is disabled by default. Band gains range from
+/// [kDarwinEqualizerMinBandGainDb] to [kDarwinEqualizerMaxBandGainDb]; the
+/// preamp ranges from [kDarwinEqualizerMinPreampDb] to
+/// [kDarwinEqualizerMaxPreampDb] (attenuation only). Because multiple positive
+/// band boosts can clip, most presets ship with a negative preamp and UIs
+/// should consider an automatic preamp.
+///
+/// All commands are safe to call on any platform: on non-Darwin platforms they
+/// are silently ignored. Capability of the current source is reported via
+/// [capabilityStream].
+class DarwinEqualizer {
+  final AudioPlayer _player;
+
+  final _enabledSubject = BehaviorSubject.seeded(false);
+  final _preampSubject = BehaviorSubject.seeded(0.0);
+  final List<BehaviorSubject<double>> _bandGainSubjects = List.generate(
+      kDarwinEqualizerFrequencies.length, (_) => BehaviorSubject.seeded(0.0));
+  final _capabilitySubject = BehaviorSubject.seeded(
+      DarwinEqualizerCapability.unavailableUnknown);
+  final _reverbSubject = BehaviorSubject<DarwinEqualizerReverb>.seeded(
+      (wet: 0.0, roomSize: 0.5, damp: 0.5));
+
+  DarwinEqualizer._(this._player);
+
+  /// Whether the equalizer is currently enabled.
+  bool get enabled => _enabledSubject.nvalue!;
+
+  /// A stream of the [enabled] state.
+  Stream<bool> get enabledStream => _enabledSubject.stream;
+
+  /// The current preamp gain in dB.
+  double get preampDb => _preampSubject.nvalue!;
+
+  /// A stream of the preamp gain in dB.
+  Stream<double> get preampStream => _preampSubject.stream;
+
+  /// The current gain (dB) of the band at [index].
+  double bandGainDb(int index) => _bandGainSubjects[index].nvalue!;
+
+  /// A stream of the gain (dB) of the band at [index].
+  Stream<double> bandGainStream(int index) => _bandGainSubjects[index].stream;
+
+  /// The most recently reported capability for the current source.
+  DarwinEqualizerCapability get capability => _capabilitySubject.nvalue!;
+
+  /// A stream of capability changes as sources change (proposal §7).
+  Stream<DarwinEqualizerCapability> get capabilityStream =>
+      _capabilitySubject.stream;
+
+  void _updateCapability(String value) {
+    final parsed = _parseDarwinEqualizerCapability(value);
+    if (parsed != _capabilitySubject.nvalue) {
+      _capabilitySubject.add(parsed);
+    }
+  }
+
+  Future<void> _guard(
+      Future<void> Function(AudioPlayerPlatform) action) async {
+    if (_player._disposed) return;
+    if (!_player._active) return;
+    try {
+      await action(await _player._platform);
+    } on UnimplementedError {
+      // Non-Darwin platform: no-op.
+    }
+  }
+
+  /// Enables or disables the equalizer. When disabled, the DSP is fully
+  /// bypassed and audio plays unprocessed.
+  Future<void> setEnabled(bool enabled) async {
+    _enabledSubject.add(enabled);
+    await _guard((p) => p.darwinEqualizerSetEnabled(
+        DarwinEqualizerSetEnabledRequest(enabled: enabled)));
+  }
+
+  /// Sets the gain (dB) of the band at [index], clamped to
+  /// [[kDarwinEqualizerMinBandGainDb], [kDarwinEqualizerMaxBandGainDb]].
+  Future<void> setBandGain(int index, double gainDb) async {
+    RangeError.checkValidIndex(index, kDarwinEqualizerFrequencies, 'index');
+    final clamped = gainDb.clamp(
+        kDarwinEqualizerMinBandGainDb, kDarwinEqualizerMaxBandGainDb);
+    _bandGainSubjects[index].add(clamped);
+    await _guard((p) => p.darwinEqualizerSetBandGain(
+        DarwinEqualizerSetBandGainRequest(
+            bandIndex: index, gainDb: clamped)));
+  }
+
+  /// Sets the preamp gain (dB), clamped to
+  /// [[kDarwinEqualizerMinPreampDb], [kDarwinEqualizerMaxPreampDb]].
+  Future<void> setPreamp(double gainDb) async {
+    final clamped =
+        gainDb.clamp(kDarwinEqualizerMinPreampDb, kDarwinEqualizerMaxPreampDb);
+    _preampSubject.add(clamped);
+    await _guard((p) => p.darwinEqualizerSetPreamp(
+        DarwinEqualizerSetPreampRequest(gainDb: clamped)));
+  }
+
+  /// The current reverb settings.
+  DarwinEqualizerReverb get reverb => _reverbSubject.nvalue!;
+
+  /// A stream of the reverb settings.
+  Stream<DarwinEqualizerReverb> get reverbStream => _reverbSubject.stream;
+
+  /// Sets the post-EQ reverb. All values are normalised knob positions clamped
+  /// to [0, 1]; `wet == 0` (the default) bypasses the reverb entirely.
+  Future<void> setReverb(
+      {required double wet, double roomSize = 0.5, double damp = 0.5}) async {
+    final settings = (
+      wet: wet.clamp(0.0, 1.0).toDouble(),
+      roomSize: roomSize.clamp(0.0, 1.0).toDouble(),
+      damp: damp.clamp(0.0, 1.0).toDouble(),
+    );
+    _reverbSubject.add(settings);
+    await _guard((p) => p.darwinEqualizerSetReverb(
+        DarwinEqualizerSetReverbRequest(
+            wet: settings.wet,
+            roomSize: settings.roomSize,
+            damp: settings.damp)));
+  }
+
+  /// Applies a built-in [preset]. The resulting band gains and preamp are
+  /// mirrored into this object's streams so the UI can reflect them.
+  Future<void> setPreset(DarwinEqualizerPreset preset) async {
+    await _guard((p) => p.darwinEqualizerSetPreset(
+        DarwinEqualizerSetPresetRequest(preset: preset.name)));
+    // Mirror the native preset into local state. Values must match the native
+    // preset table; kept small and side-effect free.
+    final gains = _presetGains[preset];
+    if (gains != null) {
+      for (var i = 0; i < gains.$2.length; i++) {
+        _bandGainSubjects[i].add(gains.$2[i]);
+      }
+      _preampSubject.add(gains.$1);
+    }
+  }
+
+  /// Resets the equalizer to flat (all bands 0 dB, preamp 0 dB). Does not change
+  /// the [enabled] state.
+  Future<void> reset() async {
+    for (final s in _bandGainSubjects) {
+      s.add(0.0);
+    }
+    _preampSubject.add(0.0);
+    await _guard(
+        (p) => p.darwinEqualizerReset(DarwinEqualizerResetRequest()));
+  }
+
+  /// Returns the current native DSP counters for software diagnostics logs.
+  Future<DarwinEqualizerDiagnostics> diagnostics() async {
+    if (_player._disposed || !_player._active) {
+      return const DarwinEqualizerDiagnostics();
+    }
+    try {
+      final response = await (await _player._platform)
+          .darwinEqualizerGetDiagnostics(
+              DarwinEqualizerGetDiagnosticsRequest());
+      return DarwinEqualizerDiagnostics._fromMessage(response.diagnostics);
+    } on UnimplementedError {
+      return const DarwinEqualizerDiagnostics();
+    }
+  }
+
+  /// Re-applies the full cached state to a freshly connected platform.
+  Future<void> _restore(AudioPlayerPlatform platform) async {
+    try {
+      await platform.darwinEqualizerSetPreamp(
+          DarwinEqualizerSetPreampRequest(gainDb: preampDb));
+      for (var i = 0; i < _bandGainSubjects.length; i++) {
+        await platform.darwinEqualizerSetBandGain(
+            DarwinEqualizerSetBandGainRequest(
+                bandIndex: i, gainDb: bandGainDb(i)));
+      }
+      final reverbSettings = reverb;
+      await platform.darwinEqualizerSetReverb(DarwinEqualizerSetReverbRequest(
+          wet: reverbSettings.wet,
+          roomSize: reverbSettings.roomSize,
+          damp: reverbSettings.damp));
+      await platform.darwinEqualizerSetEnabled(
+          DarwinEqualizerSetEnabledRequest(enabled: enabled));
+    } on UnimplementedError {
+      // Non-Darwin platform: nothing to restore.
+    }
+  }
+
+  /// Releases stream resources. Called by [AudioPlayer.dispose].
+  Future<void> _dispose() async {
+    await _enabledSubject.close();
+    await _preampSubject.close();
+    await _capabilitySubject.close();
+    await _reverbSubject.close();
+    for (final s in _bandGainSubjects) {
+      await s.close();
+    }
+  }
+}
+
+/// Local mirror of the native preset gains: (preampDb, [10 band gains]).
+const Map<DarwinEqualizerPreset, (double, List<double>)> _presetGains = {
+  DarwinEqualizerPreset.flat: (0.0, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+  DarwinEqualizerPreset.bassBoost: (-6.0, [6, 5, 4, 2, 0, 0, 0, 0, 0, 0]),
+  DarwinEqualizerPreset.bassReduce: (0.0, [-6, -5, -4, -2, 0, 0, 0, 0, 0, 0]),
+  DarwinEqualizerPreset.trebleBoost: (-6.0, [0, 0, 0, 0, 0, 1, 2, 4, 5, 6]),
+  DarwinEqualizerPreset.trebleReduce:
+      (0.0, [0, 0, 0, 0, 0, -1, -2, -4, -5, -6]),
+  DarwinEqualizerPreset.vocal: (-3.0, [-2, -2, 0, 2, 3, 3, 2, 1, 0, -1]),
+  DarwinEqualizerPreset.rock: (-6.0, [5, 3, -1, -2, -1, 1, 3, 4, 4, 4]),
+  DarwinEqualizerPreset.pop: (-4.0, [-1, 0, 2, 3, 3, 2, 0, -1, -1, -1]),
+  DarwinEqualizerPreset.jazz: (-4.0, [3, 2, 1, 2, -1, -1, 0, 1, 2, 3]),
+  DarwinEqualizerPreset.classical: (-3.0, [4, 3, 2, 1, -1, -1, 0, 2, 3, 4]),
+  DarwinEqualizerPreset.electronic: (-6.0, [5, 4, 1, 0, -1, 1, 0, 1, 4, 5]),
+  DarwinEqualizerPreset.loudness: (-8.0, [7, 5, 0, 0, -2, 0, 0, 3, 6, 7]),
+};
 
 bool _isAndroid() => !kIsWeb && Platform.isAndroid;
 bool _isDarwin() => !kIsWeb && (Platform.isIOS || Platform.isMacOS);
